@@ -67,6 +67,7 @@ import {
   parseHookExecution,
 } from './managed-hook-record.js';
 import {
+  ManagedSessionCommitRejectedError,
   managedSessionActivationStateFrom,
   managedSessionCommandKey,
   type ManagedSessionActivationState,
@@ -2152,6 +2153,7 @@ export class LocalManagedSessionAuthority {
       await this.journal.appendTransaction(records);
       this.lastRecordUuid = final.uuid;
     } catch (cause) {
+      if (cause instanceof ManagedSessionCommitRejectedError) throw cause;
       // Records may already be on disk, so the sequences this transaction
       // claimed are spent whether or not the marker landed.
       this.writeFailure =
