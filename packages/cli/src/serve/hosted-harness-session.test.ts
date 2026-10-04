@@ -28,6 +28,7 @@ import {
 } from '@qwen-code/qwen-code-core/managed-runtime/local-jsonl-managed-session-journal-store.js';
 import { resetManagedRuntimeDispatchGatesForTest } from '@qwen-code/qwen-code-core/managed-runtime/managed-runtime-dispatch-gate.js';
 import { LocalManagedSessionAuthority } from '@qwen-code/qwen-code-core/managed-runtime/managed-session-authority.js';
+import { ManagedSessionStoreHttpError } from '@qwen-code/qwen-code-core/managed-runtime/http-managed-session-store.js';
 import { openManagedSession } from '@qwen-code/qwen-code-core/managed-runtime/managed-session-assembly.js';
 import { LocalShellResultCapture } from '@qwen-code/qwen-code-core/managed-runtime/local-shell-result-capture.js';
 import { parseToolResultManifestBytes } from '@qwen-code/qwen-code-core/managed-runtime/managed-tool-result.js';
@@ -98,7 +99,10 @@ const state = vi.hoisted(() => ({
 
 vi.mock(
   '@qwen-code/qwen-code-core/managed-runtime/http-managed-session-store.js',
-  () => ({
+  async (importOriginal) => ({
+    ...(await importOriginal<
+      typeof import('@qwen-code/qwen-code-core/managed-runtime/http-managed-session-store.js')
+    >()),
     HTTP_MANAGED_SESSION_STORE_CONTRACT: { maxInlineResourceBytes: 64 * 1024 },
     createHttpManagedSessionStores: (options: {
       sessionKey: { tenantId: string; workspaceId: string; sessionId: string };
@@ -439,7 +443,13 @@ describe('Hosted Harness no-tool session', () => {
 
   it('authorizes detach after the coordinator recovers effects without a Harness lifecycle request', async () => {
     const { server, authorize, requests } = await hookApp();
-    state.authorizeOrdinary.mockRejectedValue(new Error('DRAINING'));
+    state.authorizeOrdinary.mockRejectedValue(
+      new ManagedSessionStoreHttpError(
+        409,
+        'managed_session_lifecycle_active',
+        'DRAINING',
+      ),
+    );
     const authority = { operationId: 'recovered-effects', claimGeneration: 2 };
     await authorize(supertest(server).post(`/session/${SESSION_ID}/detach`))
       .send({ authority })
@@ -456,7 +466,13 @@ describe('Hosted Harness no-tool session', () => {
 
   it('retains the attachment and restores authority when a recovered detach claim is rejected', async () => {
     const { server, authorize, requests } = await hookApp();
-    state.authorizeOrdinary.mockRejectedValue(new Error('DRAINING'));
+    state.authorizeOrdinary.mockRejectedValue(
+      new ManagedSessionStoreHttpError(
+        409,
+        'managed_session_lifecycle_active',
+        'DRAINING',
+      ),
+    );
     state.authorizeLifecycle.mockRejectedValueOnce(new Error('stale claim'));
     await authorize(supertest(server).post(`/session/${SESSION_ID}/detach`))
       .send({ authority: { operationId: 'stale', claimGeneration: 1 } })
@@ -475,7 +491,13 @@ describe('Hosted Harness no-tool session', () => {
 
   it('rejects malformed detach authority without bypassing a persistent fence', async () => {
     const { server, authorize, requests } = await hookApp();
-    state.authorizeOrdinary.mockRejectedValue(new Error('DRAINING'));
+    state.authorizeOrdinary.mockRejectedValue(
+      new ManagedSessionStoreHttpError(
+        409,
+        'managed_session_lifecycle_active',
+        'DRAINING',
+      ),
+    );
     await authorize(supertest(server).post(`/session/${SESSION_ID}/detach`))
       .send({ authority: { operationId: 'malformed', claimGeneration: 0 } })
       .expect(400);
@@ -490,7 +512,12 @@ describe('Hosted Harness no-tool session', () => {
   it('uses the legacy close admission for an attached protocol zero Session with Hooks', async () => {
     const { server, authorize, requests } = await hookApp();
     state.authorizeOrdinary.mockImplementation(async (kind) => {
-      if (kind !== 'legacy-close') throw new Error('Ordinary admission closed');
+      if (kind !== 'legacy-close')
+        throw new ManagedSessionStoreHttpError(
+          409,
+          'managed_session_lifecycle_active',
+          'Ordinary admission closed',
+        );
     });
     await authorize(supertest(server).post(`/session/${SESSION_ID}/prompt`))
       .send({})
@@ -505,6 +532,61 @@ describe('Hosted Harness no-tool session', () => {
         .map((request) => request.input.hook_event_name),
     ).toEqual(['SessionEnd', 'SessionDelete']);
   });
+
+  it.each([
+    ['prompt', new TypeError('network timeout')],
+    ['detach', new TypeError('network timeout')],
+    [
+      'prompt',
+      new ManagedSessionStoreHttpError(
+        503,
+        'internal_error',
+        'Store unavailable',
+      ),
+    ],
+    [
+      'detach',
+      new ManagedSessionStoreHttpError(
+        503,
+        'internal_error',
+        'Store unavailable',
+      ),
+    ],
+    [
+      'prompt',
+      new ManagedSessionStoreHttpError(
+        409,
+        'managed_session_writer_conflict',
+        'Writer fenced',
+      ),
+    ],
+    [
+      'detach',
+      new ManagedSessionStoreHttpError(
+        409,
+        'managed_session_writer_conflict',
+        'Writer fenced',
+      ),
+    ],
+  ])(
+    'reports an ordinary %s authorization failure as unavailable: %s',
+    async (route, cause) => {
+      const { server, authorize, requests } = await hookApp();
+      state.authorizeOrdinary.mockRejectedValueOnce(cause);
+      const rejected = await authorize(
+        supertest(server).post(`/session/${SESSION_ID}/${route}`),
+      ).send({});
+      expect(rejected.status).toBe(503);
+      expect(rejected.body.code).toBe(
+        'hosted_execution_authorization_unavailable',
+      );
+      expect(state.model).not.toHaveBeenCalled();
+      expect(requests).toEqual([]);
+      await authorize(supertest(server).post(`/session/${SESSION_ID}/detach`))
+        .send({})
+        .expect(204);
+    },
+  );
 
   it('resumes the undispatched Delete Hook after revocation without cancelling or repeating End', async () => {
     const { server, authorize, requests } = await hookApp();
